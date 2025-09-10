@@ -1,8 +1,10 @@
 ﻿
 using System.Globalization;
 using System.Xml;
+using System.Xml.Linq;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using static System.Net.WebRequestMethods;
 
 namespace CurrencyConversion.Service.Rates
 {
@@ -21,43 +23,46 @@ namespace CurrencyConversion.Service.Rates
 
         public async Task<(DateTime asOfDate, Dictionary<string, decimal> dkkPerUnit)> GetLatestAsync(CancellationToken ct)
         {
-            using var resp = await _http.GetAsync(_url, ct);
-            resp.EnsureSuccessStatusCode();
-            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            // Fetch response as string
+            var response = await _http.GetStringAsync(_url, ct);
 
-            var map = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
-            DateTime asOfDate = DateTime.UtcNow.Date;
+            // Parse XML
+            var xml = XDocument.Parse(response);
+            var root = xml.Root;
 
-            var settings = new XmlReaderSettings { IgnoreWhitespace = true, Async = true };
-            using var reader = XmlReader.Create(stream, settings);
+            // Read refAmount (default 1)
+            decimal refAmount = 100m; // API gives rates for 100 units of currency
 
-            while (await reader.ReadAsync())
+
+            // Read dailyrates date
+            DateTime asOf = DateTime.UtcNow.Date;
+            var dailyRates = root?.Element("dailyrates");
+            if (dailyRates != null && DateTime.TryParseExact(dailyRates.Attribute("id")?.Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedDate))
             {
-                if (reader.NodeType == XmlNodeType.Element && reader.Name.Equals("dailyrates", StringComparison.OrdinalIgnoreCase))
-                {
-                    var id = reader.GetAttribute("id");
-                    if (DateTime.TryParse(id, out var parsed)) asOfDate = parsed;
-                }
+                asOf = parsedDate;
+            }
 
-                if (reader.NodeType == XmlNodeType.Element && reader.Name.Equals("currency", StringComparison.OrdinalIgnoreCase))
+            // Build dictionary of currency rates
+            var map = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+            if (dailyRates != null)
+            {
+                foreach (var currency in dailyRates.Elements("currency"))
                 {
-                    var code = reader.GetAttribute("code");
-                    var rateStr = reader.GetAttribute("rate");
-                    if (!string.IsNullOrWhiteSpace(code) && !string.IsNullOrWhiteSpace(rateStr))
+                    var code = currency.Attribute("code")?.Value;
+                    var rateStr = currency.Attribute("rate")?.Value;
+                    if (!string.IsNullOrWhiteSpace(code) && decimal.TryParse(rateStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var rate))
                     {
-                        if (decimal.TryParse(rateStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var ratePer100))
-                        {
-                            var perUnit = ratePer100 / 100m;
-                            map[code!] = decimal.Round(perUnit, 6);
-                        }
+                        // Convert to per-unit rate in DKK
+                        var perUnit = rate / refAmount;
+                        map[code!] = decimal.Round(perUnit, 6);
                     }
                 }
             }
 
             // Ensure DKK exists
-            map["DKK"] = 1.0m;
-            _log.Info($"Fetched {map.Count} rates for {asOfDate.ToString("yyyy-MM-dd")}");
-            return (asOfDate, map);
+            map["DKK"] = refAmount;
+
+            return (asOf, map);
         }
     }    
 }
